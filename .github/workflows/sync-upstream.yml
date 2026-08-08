@@ -3,7 +3,6 @@ name: Sync fork with Hermes upstream
 on:
   workflow_dispatch:
   schedule:
-    # 每天北京时间 00:07
     - cron: "7 16 * * *"
 
 permissions:
@@ -12,13 +11,46 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Sync main from upstream
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Sync source while preserving fork workflows
         run: |
-          gh api --method POST \
-            "/repos/${GITHUB_REPOSITORY}/merge-upstream" \
-            -f branch=main
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+
+          if ! git merge --no-commit --no-ff upstream/main; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if grep -qv '^\.github/workflows/' <<<"$conflicts"; then
+              git merge --abort
+              echo "Source-code conflict requires manual review:"
+              echo "$conflicts"
+              exit 1
+            fi
+          fi
+
+          git checkout HEAD -- .github/workflows
+          git add .github/workflows
+
+          if git diff --cached --quiet; then
+            git merge --abort 2>/dev/null || true
+            echo "No source update available."
+            exit 0
+          fi
+
+          git commit -m "chore: sync Hermes source from upstream"
+          git push origin HEAD:main
