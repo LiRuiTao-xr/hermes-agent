@@ -3,15 +3,21 @@ name: Sync fork with Hermes upstream
 on:
   workflow_dispatch:
   schedule:
-    - cron: "7 16 * * *"
+    # GitHub cron cannot express an exact "every 5 days" interval.
+    # These dates keep runs roughly five days apart without a 31st-to-1st double run.
+    - cron: "7 16 1,6,11,16,21,26 * *"
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-hermes-upstream-main
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v6
@@ -20,13 +26,16 @@ jobs:
           persist-credentials: true
 
       - name: Sync source while preserving fork workflows
+        shell: bash
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          fork_head="$(git rev-parse HEAD)"
           git remote add upstream https://github.com/NousResearch/hermes-agent.git
-          git fetch upstream main
+          git fetch --no-tags upstream main
 
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date."
@@ -43,12 +52,23 @@ jobs:
             fi
           fi
 
-          git checkout HEAD -- .github/workflows
-          git add .github/workflows
+          # Make the workflow directory byte-for-byte identical to the fork's
+          # pre-merge state. `git checkout` alone does not remove workflow files
+          # newly added upstream, which makes the GITHUB_TOKEN push get rejected.
+          git rm -r -f --ignore-unmatch .github/workflows
+          git checkout "$fork_head" -- .github/workflows
+          git add -A .github/workflows
+
+          if ! git diff --cached --quiet "$fork_head" -- .github/workflows; then
+            echo "Refusing to push: fork workflow preservation check failed."
+            git diff --cached --name-status "$fork_head" -- .github/workflows
+            git merge --abort 2>/dev/null || true
+            exit 1
+          fi
 
           if git diff --cached --quiet; then
             git merge --abort 2>/dev/null || true
-            echo "No source update available."
+            echo "No source update available after preserving fork workflows."
             exit 0
           fi
 
