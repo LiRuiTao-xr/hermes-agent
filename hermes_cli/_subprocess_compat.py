@@ -220,6 +220,26 @@ def windows_hide_flags() -> int:
     return _CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 
+
+def no_prompt_git_kwargs() -> dict:
+    """``subprocess.run`` kwargs for the updater's network git calls.
+
+    GitHub answers anonymous fetches with HTTP 401 during outages (and for
+    unreachable repos); git then prompts ``Username for 'https://github.com':``
+    on the inherited terminal and the update sits there forever. Disable the
+    prompt so the fetch fails fast into ``_classify_fetch_failure``. Only the
+    *prompt* is disabled — a configured credential helper / askpass still
+    runs, so a private-fork origin keeps authenticating non-interactively.
+    Lives here, dependency-free, because the update hand-off's bootstrap
+    interpreter runs the treeless conversion before any dependency exists.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "Never"
+    # Every network git spawn (fetch/pull/shallow heal) runs under a console-less
+    # desktop backend on Windows; hide the per-spawn console (#117781).
+    return {"stdin": subprocess.DEVNULL, "env": env, "creationflags": windows_hide_flags()}
+
 def suppress_platform_ver_console() -> None:
     """Stub ``platform._syscmd_ver`` on Windows so it never flashes a console. No-op elsewhere.
 
@@ -470,11 +490,18 @@ def noninteractive_git_env(base: "Mapping[str, str] | None" = None) -> dict[str,
 
 
 _FILTER_COMMAND_KEY = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.IGNORECASE)
-# Any ``includeIf`` is evaluated against the CURRENT checkout: ``onbranch:`` against the current
-# branch, ``gitdir:`` against the current git dir (``.git/worktrees/<name>`` during ``worktree add``),
-# so the spawned git can load filters this discovery never saw; refuse rather than half-harden.
+# ``includeIf`` is evaluated against the CURRENT checkout: ``onbranch:`` against the current branch,
+# ``gitdir:`` against the current git dir (``.git/worktrees/<name>`` during ``worktree add``), so
+# the spawned git can load an include this discovery's ``--includes`` skipped. Every include target
+# is therefore read directly, whatever its condition, and its filter names are neutralized too.
 # Global/system config is already /dev/null, so only repo-local includes reach this.
 _INCLUDE_IF_KEY = re.compile(r"^includeif\..*\.path$", re.IGNORECASE)
+# Any include (conditional or not) inside an include target: discovery does not walk it twice.
+_INCLUDE_KEY = re.compile(r"^include(?:if\..*)?\.path$", re.IGNORECASE)
+# `git config --get-regexp` pattern for the keys discovery reads (filter commands and includes).
+_DISCOVERY_KEYS_REGEXP = r"^(filter\..*\.(clean|smudge|process)|include\.path|includeif\..*\.path)$"
+# Each include target costs one bounded spawn on every hardened git call; refuse past this many.
+_MAX_INCLUDE_TARGETS = 16
 # Each discovered key costs two env entries; a repo with tens of thousands of filters would make
 # every spawn fail with E2BIG ("Argument list too long"), so refuse past a generous cap.
 _MAX_FILTER_KEYS = 256
@@ -498,25 +525,65 @@ def noninteractive_repo_git_env(
     env = noninteractive_git_env(base)
     # bounded_probe_run, not subprocess.run: Windows' post-timeout communicate() can deadlock and
     # a bare spawn flashes a console. (Not bounded_git_probe: rc 1 = "no filters" is a verdict.)
+    # One probe lists the filter keys and the include paths with their origin file: -z --show-origin
+    # yields "file:<origin>", "<key>\n<value>" pairs.
     proc = bounded_probe_run(
-        [
-            "git", "-C", str(cwd), "config", "--includes", "--name-only", "-z",
-            "--get-regexp", r"^(filter\..*\.(clean|smudge|process)|includeif\..*\.path)$",
-        ],
+        ["git", "-C", str(cwd), "config", "--includes", "--show-origin", "-z", "--get-regexp",
+         _DISCOVERY_KEYS_REGEXP],
         timeout=2, env=env,
     )
     if proc is None or proc.returncode not in (0, 1):
         return None
+    names: list[str] = []
+    targets: set[Path] = set()
+    toplevel: "Path | None" = None
+    fields = proc.stdout.split("\0")
+    for origin, entry in zip(fields[0::2], fields[1::2]):
+        key, _, value = entry.partition("\n")
+        if not _INCLUDE_IF_KEY.fullmatch(key):
+            names.append(key)
+            continue
+        if not origin.startswith("file:"):
+            return None
+        origin_path = Path(origin[len("file:"):])
+        if not origin_path.is_absolute():
+            # git prints repo-local origins relative to the worktree top level, not to *cwd*; with a
+            # caller-set GIT_DIR/GIT_WORK_TREE they are relative to something else, so refuse.
+            if env.get("GIT_DIR") or env.get("GIT_WORK_TREE"):
+                return None
+            if toplevel is None:
+                top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                                        timeout=2, env=env)
+                if top is None or top.returncode != 0:
+                    return None
+                toplevel = Path(top.stdout.rstrip("\r\n"))  # a checkout path may end in a space
+            origin_path = toplevel / origin_path
+        # A relative include path resolves against the directory of the config file naming it.
+        target = (origin_path.parent / os.path.expanduser(value)).resolve()
+        if target in targets or not target.exists():
+            continue  # already read, or missing (git skips a missing include file)
+        if not target.is_file() or len(targets) >= _MAX_INCLUDE_TARGETS:
+            return None  # a FIFO/device/directory, or too many targets to read on every call
+        targets.add(target)
+        probe = bounded_probe_run(
+            ["git", "config", "--file", str(target), "--name-only", "-z", "--get-regexp", _DISCOVERY_KEYS_REGEXP],
+            timeout=2, env=env,
+        )
+        if probe is None or probe.returncode not in (0, 1):
+            return None
+        found = probe.stdout.split("\0")
+        # An include inside an include target would need the same walk again; refuse instead.
+        if any(_INCLUDE_KEY.fullmatch(name) for name in found):
+            return None
+        names.extend(found)
 
     keys: list[str] = []
     required: list[str] = []
     seen: set[str] = set()
-    # Dedup on the exact name ``--name-only`` prints: git lowercases section and variable but keeps
-    # the subsection's case, and ``[filter "Evil"]`` is a different driver from ``[filter "evil"]``.
-    for raw in proc.stdout.split("\0"):
+    # Dedup on the exact key name git prints: section and variable lowercased, subsection case kept,
+    # and ``[filter "Evil"]`` is a different driver from ``[filter "evil"]``.
+    for raw in names:
         key = raw.strip()
-        if _INCLUDE_IF_KEY.fullmatch(key):
-            return None
         if not key or key in seen or not _FILTER_COMMAND_KEY.fullmatch(key):
             continue
         seen.add(key)
@@ -730,9 +797,11 @@ def _legacy_kill_process_tree(proc: "subprocess.Popen") -> None:
 def bounded_probe_run(
     argv: Sequence[str], *, timeout: float, errors: str = "replace",
     env: "Mapping[str, str] | None" = None, cwd: "str | os.PathLike[str] | None" = None,
-    raise_on_spawn_failure: bool = False,
+    raise_on_spawn_failure: bool = False, input: "str | None" = None,
 ) -> "subprocess.CompletedProcess[str] | None":
     """Deadlock-safe ``subprocess.run(argv, capture_output=True, timeout=…)`` for fail-open probes.
+
+    ``input`` is written to the child's stdin (closed afterwards); without it stdin is ``DEVNULL``.
 
     Returns a ``CompletedProcess`` when the child finished within *timeout* (any exit code), or
     ``None`` on spawn failure or timeout. With ``raise_on_spawn_failure=True`` the ``Popen``
@@ -756,7 +825,8 @@ def bounded_probe_run(
         from hermes_cli.local_runtime.processes import spawn_server
 
         proc, job = spawn_server(
-            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
             text=True, encoding="utf-8", errors=errors,
             env=dict(env) if env is not None else None, cwd=cwd, **_popen_kwargs)
     except Exception:
@@ -764,20 +834,29 @@ def bounded_probe_run(
             raise
         return None
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=input, timeout=timeout)
     except Exception:
         # Timeout OR any other communicate() failure (torn-down pipe, decode error): tree-kill and
         # drain bounded — leaving it running would leak the suspended-descendant class this guards.
         _close_job(job)
-        kill_process_tree(proc)
-        try:
-            proc.communicate(timeout=1)
-        except Exception:
-            pass
+        kill_and_drain(proc, 1)
         return None
     # The probe exited on its own; anything it left behind (`&` jobs) goes with the job.
     _close_job(job)
     return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+
+
+def kill_and_drain(proc: "subprocess.Popen", seconds: float) -> "tuple | None":
+    """Tree-kill *proc* (:func:`kill_process_tree`), then read what its pipes still hold for at
+    most *seconds*: ``(stdout, stderr)``, or ``None`` when a descendant the kill missed still
+    holds them. Those pipes are left to ``communicate()``'s reader threads, never closed
+    (closing a pipe a thread is reading blocks; a ``with Popen`` exit would close them)."""
+    kill_process_tree(proc)
+    try:
+        return proc.communicate(timeout=seconds)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        proc.stdin = proc.stdout = proc.stderr = None
+        return None
 
 
 def _close_job(job) -> None:
