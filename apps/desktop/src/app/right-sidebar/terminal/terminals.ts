@@ -1,3 +1,4 @@
+import { randomUuid } from '@hermes/shared'
 import type { WebglAddon } from '@xterm/addon-webgl'
 import type { Terminal } from '@xterm/xterm'
 import { atom, computed } from 'nanostores'
@@ -258,8 +259,7 @@ export const $activeTerminal = computed(
   (list, id) => list.find(term => term.id === id) ?? null
 )
 
-const newId = () =>
-  globalThis.crypto?.randomUUID?.() ?? `term-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+const newId = () => randomUuid()
 
 /** Append a fresh terminal and focus it. Captures the current cwd once (its only
  *  tie to session/project state); pass an explicit cwd to override. Returns the id. */
@@ -472,12 +472,26 @@ export function markTerminalPersistent(id: string): void {
 }
 
 export function updateTerminalReviveBuffer(id: string, reviveBuffer: string): void {
+  const terminals = $terminals.get()
+  const index = terminals.findIndex(term => term.id === id)
+  const term = terminals[index]
+
+  if (!term || term.kind !== 'user' || term.persistent) {
+    return
+  }
+
   const capped =
     reviveBuffer.length > MAX_REVIVE_BUFFER_CHARS ? reviveBuffer.slice(-MAX_REVIVE_BUFFER_CHARS) : reviveBuffer
 
-  $terminals.set(
-    $terminals.get().map(term => (term.id === id && term.kind === 'user' && !term.persistent ? { ...term, reviveBuffer: capped } : term))
-  )
+  // Publishing also serializes every user tab and updates workspace subscribers.
+  // Stable TUI screens can produce identical snapshots for every capture.
+  if (term.reviveBuffer === capped) {
+    return
+  }
+
+  const next = terminals.slice()
+  next[index] = { ...term, reviveBuffer: capped }
+  $terminals.set(next)
 }
 
 /** Record the shell's latest working directory for a tab so the next launch can
