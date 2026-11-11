@@ -16,7 +16,8 @@ CREATE_FIELDS = frozenset({'request_id', 'source', 'cwd', 'model', 'toolsets',
                            'provider', 'base_url', 'reasoning', 'max_turns', 'ignore_rules', 'api_key', 'editor',
                            'yolo', 'safe_mode', 'ignore_user_config',
                            'skills', 'checkpoints', 'accept_hooks', 'pass_session_id', 'follow_profile_config',
-                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env'})
+                           'service_tier', 'cwd_explicit', 'run_budget', 'verbose', 'row_cwd', 'client_env',
+                           'client'})
 # Sections a ``follow_profile_config`` session re-reads from the owning profile's CURRENT config each
 # turn (main's Bot Chat row), credentials included: a frozen key never crosses a profile route change.
 FOLLOW_SECTIONS = ('model', 'providers', 'custom_providers', 'fallback_providers', 'fallback_model', 'model_aliases',
@@ -450,6 +451,10 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         cwd = _profile_workspace_cwd(get_hermes_home()) or cwd
     from gateway.session_local_editor import validate_editor
     validate_editor(source, params.get('editor'))
+    if 'client' in params:  # a self-declared label kept in the request as sent; no decision below reads it
+        from gateway.session_client import client_problem
+        if problem := client_problem(params['client']):
+            _refuse('client', problem)
     launch_skills(params)
     config = present_sections(json.loads(json.dumps(config)))
     picked_route = {'model', 'provider', 'base_url'} & set(_without_auto_pick(params))
@@ -1111,14 +1116,17 @@ def refused_turn_result(policy, exc) -> dict | None:
 
 
 @contextmanager
-def policy_scope(policy, *, authority=None):
+def policy_scope(policy, *, authority=None, home=None):
+    """Bind a session's frozen policy for a turn. *home* is the profile that owns the session (its
+    terminal policy's owner); it defaults to *authority*'s profile."""
     if policy is None:
         yield
         return
     if not workspace_ready(policy):
         raise RuntimeStoreError('workspace_unavailable', field='cwd', detail=policy.cwd)
     from agent.runtime_cwd import set_session_cwd
-    from tools.terminal_scope import set_terminal_scope, reset_terminal_scope
+    from agent.runtime_scope import bind_terminal_policy
+    from tools.terminal_scope import reset_terminal_scope
     terminal = json.loads(policy.terminal_json)
     if policy.config_secret_ref is not None:
         from gateway.session_policy_credentials import recover_config_secrets
@@ -1132,7 +1140,8 @@ def policy_scope(policy, *, authority=None):
         from dataclasses import replace
         active = replace(policy, toolsets=policy.current_toolsets(policy.config(authority, secrets=False)))
     cwd_token = set_session_cwd(policy.cwd)
-    terminal_token = set_terminal_scope(terminal)
+    owner = home if home is not None else getattr(authority, 'profile_id', None)
+    terminal_token = bind_terminal_policy(terminal, profile_home=owner)
     policy_token = _ACTIVE_POLICY.set(active)
     from gateway.session_local_editor import editor_scope
     try:
